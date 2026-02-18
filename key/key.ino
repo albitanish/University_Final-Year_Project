@@ -18,10 +18,10 @@
 
 // EEPROM
 #define EEPROM_ADDR 0
-#define EEPROM_SAVE_INTERVAL 10 // Save every 10 button presses
+#define EEPROM_SAVE_INTERVAL 10
 
 // Debouncing
-#define DEBOUNCE_DELAY 50  // 50ms debounce
+#define DEBOUNCE_DELAY 50
 
 static const uint32_t CAR_ID    = 0xCAFEBABE;
 static const uint32_t KEYFOB_ID = 0x12345678;
@@ -135,7 +135,6 @@ uint32_t generateTOTP(uint32_t epoch) {
 }
 
 void saveCounterIfNeeded() {
-  // Only save to EEPROM every N button presses to reduce wear
   if (rollingCounter - lastSavedCounter >= EEPROM_SAVE_INTERVAL) {
     EEPROM.put(EEPROM_ADDR, rollingCounter);
     EEPROM.commit();
@@ -153,17 +152,27 @@ void sendPacket(uint8_t action) {
   uint32_t epoch = (millis()/1000 + timeOffset) / 30;
   pkt.totp = generateTOTP(epoch);
 
-  ELECHOUSE_cc1101.SendData((uint8_t*)&pkt, sizeof(pkt));
-  Serial.println(F("Packet sent"));
+  Serial.printf("Sending packet: action=%d, counter=%lu, totp=%lu\n", 
+                action, rollingCounter-1, pkt.totp);
 
-  // Save counter periodically instead of every time
+  ELECHOUSE_cc1101.SendData((uint8_t*)&pkt, sizeof(pkt));
+  delay(50); // Wait for transmission to complete
+  
+  Serial.println(F("Packet sent successfully"));
+
   saveCounterIfNeeded();
 }
 
 void listenForSync() {
+  Serial.println("Listening for sync...");
   unsigned long start = millis();
-  while (millis() - start < 5000) { 
-      if (ELECHOUSE_cc1101.CheckRxFifo(0)) { 
+  
+  // Shorter listen window and more frequent yields
+  while (millis() - start < 2000) {  // Reduced from 5000ms to 2000ms
+      yield(); // CRITICAL: Feed the watchdog
+      ESP.wdtFeed(); // Explicitly feed watchdog
+      
+      if (ELECHOUSE_cc1101.CheckRxFifo(100)) {  // 100ms timeout
           byte len = ELECHOUSE_cc1101.ReceiveData(cc1101_data_buffer); 
           
           if (len == sizeof(int32_t)) {
@@ -171,22 +180,27 @@ void listenForSync() {
               memcpy(&newOffset, cc1101_data_buffer, sizeof(int32_t)); 
               timeOffset = newOffset;
               Serial.printf("Time sync received! New offset=%ld\n", timeOffset);
-              break;
+              return;
           }
       }
-      yield(); // Allow background tasks
+      
+      delay(50); // Small delay between checks, also feeds watchdog
   }
+  Serial.println("No sync received");
 }
 
 void setup() 
 {
   Serial.begin(115200);
+  delay(100); // Allow serial to stabilize
+  
+  Serial.println("\n\nStarting Keyfob...");
+  
   EEPROM.begin(512);
 
   pinMode(BTN_UNLOCK, INPUT_PULLUP);
   pinMode(BTN_LOCK, INPUT_PULLUP);
 
-  // Load counter
   EEPROM.get(EEPROM_ADDR, rollingCounter);
   lastSavedCounter = rollingCounter;
   Serial.printf("Loaded rolling counter: %lu\n", rollingCounter);
@@ -194,71 +208,80 @@ void setup()
   cc1101initialize();
 
   if (ELECHOUSE_cc1101.getCC1101()) {
-    Serial.println(F("cc1101 initialized. Connection OK"));
+    Serial.println(F("CC1101 initialized. Connection OK"));
   } else {
-    Serial.println(F("cc1101 connection error! check the wiring."));
+    Serial.println(F("CC1101 connection error! Check wiring."));
+    while(1) {
+      yield();
+      delay(1000);
+    }
   }
   
-  Serial.println("Execution starts");
-  
-  // Disable watchdog
-  ESP.wdtDisable(); 
-  Serial.println("WDT Disabled");
-  
-  // Set to receive mode
   ELECHOUSE_cc1101.SetRx();
-  delay(10); // Small delay after mode switch
+  delay(50);
   
-  Serial.println("Keyfob ready");
+  Serial.println("Keyfob ready. Press buttons to send packets.");
 }
 
 void loop() 
 {
+  // CRITICAL: Feed watchdog regularly
+  yield();
+  ESP.wdtFeed();
+  
   unsigned long currentTime = millis();
   
-  // Handle UNLOCK button with debouncing
+  // Handle UNLOCK button
   bool unlockPressed = (digitalRead(BTN_UNLOCK) == LOW);
   
   if (unlockPressed && !unlockProcessed) {
     if (currentTime - lastUnlockPress > DEBOUNCE_DELAY) {
-      Serial.println("Unlock Button Pressed");
+      Serial.println("\n=== UNLOCK Button Pressed ===");
       
       ELECHOUSE_cc1101.SetTx();
-      delay(10); // Allow mode switch
+      delay(20);
+      
       sendPacket(ACTION_UNLOCK);
       
       ELECHOUSE_cc1101.SetRx();
-      delay(10); // Allow mode switch
+      delay(20);
+      
       listenForSync();
       
       unlockProcessed = true;
       lastUnlockPress = currentTime;
+      
+      Serial.println("=== UNLOCK Complete ===\n");
     }
   } else if (!unlockPressed) {
     unlockProcessed = false;
   }
   
-  // Handle LOCK button with debouncing
+  // Handle LOCK button
   bool lockPressed = (digitalRead(BTN_LOCK) == LOW);
   
   if (lockPressed && !lockProcessed) {
     if (currentTime - lastLockPress > DEBOUNCE_DELAY) {
-      Serial.println("Lock Button Pressed");
+      Serial.println("\n=== LOCK Button Pressed ===");
       
       ELECHOUSE_cc1101.SetTx();
-      delay(10); // Allow mode switch
+      delay(20);
+      
       sendPacket(ACTION_LOCK);
       
       ELECHOUSE_cc1101.SetRx();
-      delay(10); // Allow mode switch
+      delay(20);
+      
       listenForSync();
       
       lockProcessed = true;
       lastLockPress = currentTime;
+      
+      Serial.println("=== LOCK Complete ===\n");
     }
   } else if (!lockPressed) {
     lockProcessed = false;
   }
   
-  yield(); // Allow background tasks
+  delay(10); // Small delay to prevent tight looping
 }
